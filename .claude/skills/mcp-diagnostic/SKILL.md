@@ -24,7 +24,7 @@ discovery, JSON parsing, server classification, secret redaction, health checks,
 auditing.
 
 ```bash
-bash "$(find ~/.claude/skills/mcp-diagnostic/scripts .claude/skills/mcp-diagnostic/scripts -name 'mcp-diagnose.sh' 2>/dev/null | head -1)"
+SCRIPT=""; for d in "$HOME/.claude/skills/mcp-diagnostic/scripts" ".claude/skills/mcp-diagnostic/scripts"; do [ -f "$d/mcp-diagnose.sh" ] && SCRIPT="$d/mcp-diagnose.sh" && break; done; if [ -n "$SCRIPT" ]; then bash "$SCRIPT"; else echo "Script not found"; fi
 ```
 
 If the script is not found at either path, tell the user:

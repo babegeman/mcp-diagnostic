@@ -9,15 +9,52 @@
 # Usage: bash mcp-diagnose.sh [--section <name>] [--project-dir <path>]
 #   Sections: all (default), configs, servers, health, settings
 # ─────────────────────────────────────────────────────────────────────
-set -uo pipefail
+set -euo pipefail
 
-SECTION="${1:-all}"
-PROJECT_DIR="${2:-$(pwd)}"
+# ── Argument parsing ────────────────────────────────────────────────
+SECTION="all"
+PROJECT_DIR="$(pwd)"
 
-# ── Preflight: verify jq ────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --section)
+      SECTION="${2:-all}"
+      shift 2
+      ;;
+    --project-dir)
+      PROJECT_DIR="${2:-$(pwd)}"
+      shift 2
+      ;;
+    -*)
+      echo "{\"error\":\"Unknown option: $1. Usage: bash mcp-diagnose.sh [--section <name>] [--project-dir <path>]\"}" >&2
+      exit 1
+      ;;
+    *)
+      # Legacy positional arg support: first arg is section, second is project-dir
+      if [[ "$SECTION" == "all" ]]; then
+        SECTION="$1"
+      else
+        PROJECT_DIR="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+# ── Preflight: verify dependencies ──────────────────────────────────
 if ! command -v jq &>/dev/null; then
   echo '{"error":"jq is required but not installed. Install with: apt-get install jq / brew install jq"}' >&2
   exit 1
+fi
+
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+  echo '{"error":"bash 4+ is required. Current version: '"${BASH_VERSION}"'"}' >&2
+  exit 1
+fi
+
+HAS_CURL=true
+if ! command -v curl &>/dev/null; then
+  HAS_CURL=false
 fi
 
 # ── Platform detection ──────────────────────────────────────────────
@@ -249,10 +286,10 @@ classify_server() {
       local redacted_env
       redacted_env="$(redact_json_object "$env_json")"
 
-      # Check for ${VAR} references in env values
+      # Check for ${VAR} references in env values (POSIX-compatible, no grep -P)
       local env_var_refs
       env_var_refs="$(echo "$env_json" | jq -r 'to_entries[] | select(.value | test("\\$\\{")) | .value' 2>/dev/null | \
-        grep -oP '\$\{[^}]+\}' 2>/dev/null | sort -u | while read -r ref; do
+        grep -o '\${[^}]*}' 2>/dev/null | sort -u | while read -r ref; do
           varname="${ref#\$\{}"
           varname="${varname%\}}"
           varname="${varname%%:-*}"
@@ -261,8 +298,10 @@ classify_server() {
           else
             echo "$varname=UNSET"
           fi
-        done | jq -Rn '[inputs | split("=") | { (.[0]): .[1] }] | add // {}')"
+        done | jq -Rn '[inputs | split("=") | { (.[0]): .[1] }] | add // {}' 2>/dev/null)" || env_var_refs='{}'
 
+      # Provide safe default for env_var_refs (avoid bash nested-brace parsing issues)
+      local empty_json='{}'
       result="$(echo "$result" | jq \
         --arg cmd "$cmd" \
         --argjson args "$args_json" \
@@ -270,7 +309,7 @@ classify_server() {
         --arg cwd "$cwd" \
         --arg pkg_handler "$pkg_handler" \
         --arg package "$package" \
-        --argjson env_var_refs "${env_var_refs:-{\}}" \
+        --argjson env_var_refs "${env_var_refs:-$empty_json}" \
         '. + {
           command: $cmd,
           args: $args,
@@ -370,7 +409,13 @@ health_check_server() {
           ;;
         docker)
           if command -v docker &>/dev/null; then
-            if timeout 5 docker info &>/dev/null; then
+            local docker_check=false
+            if command -v timeout &>/dev/null; then
+              timeout 5 docker info &>/dev/null && docker_check=true
+            else
+              docker info &>/dev/null && docker_check=true
+            fi
+            if [[ "$docker_check" == true ]]; then
               server_json="$(echo "$server_json" | jq '. + { docker_running: true }')"
               # Check if image exists
               local image
@@ -446,25 +491,30 @@ health_check_server() {
         local headers_json
         headers_json="$(echo "$server_json" | jq -r '.original_headers // .headers // {}')"
 
-        # Build curl command with headers from config
-        local curl_cmd="curl -sS -o /dev/null -w '%{http_code}' --max-time 10"
-        curl_cmd="$curl_cmd -H 'Content-Type: application/json'"
+        local http_code="000"
+        local response_body=""
 
-        # Add configured headers
-        if [[ "$(echo "$headers_json" | jq 'length')" -gt 0 ]]; then
-          while IFS=$'\t' read -r key val; do
-            curl_cmd="$curl_cmd -H '$key: $val'"
-          done < <(echo "$headers_json" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+        if [[ "$HAS_CURL" == true ]]; then
+          # Build curl args as an array (safe — no eval, no shell injection)
+          local -a curl_args=( -sS --max-time 10 -H "Content-Type: application/json" )
+
+          # Add configured headers safely
+          if [[ "$(echo "$headers_json" | jq 'length')" -gt 0 ]]; then
+            while IFS=$'\t' read -r key val; do
+              curl_args+=( -H "$key: $val" )
+            done < <(echo "$headers_json" | jq -r 'to_entries[] | "\(.key)\t\(.value)"')
+          fi
+
+          curl_args+=( -X POST -d "$mcp_initialize_payload" "$url" )
+
+          # Execute: get HTTP status code
+          http_code="$(curl -o /dev/null -w '%{http_code}' "${curl_args[@]}" 2>/dev/null)" || http_code="000"
+
+          # Execute again to capture response body for MCP validation
+          response_body="$(curl "${curl_args[@]}" 2>/dev/null)" || response_body=""
+        else
+          add_issue "warning" "curl not found — cannot perform HTTP health check"
         fi
-
-        curl_cmd="$curl_cmd -X POST -d '$mcp_initialize_payload' '$url'"
-
-        # Execute the MCP initialize request
-        local http_code response_body
-        http_code="$(eval "$curl_cmd" 2>/dev/null)" || http_code="000"
-
-        # Also capture response body to validate it's MCP JSON-RPC
-        response_body="$(eval "curl -sS --max-time 10 -H 'Content-Type: application/json' $(echo "$headers_json" | jq -r 'to_entries[] | "-H \"\(.key): \(.value)\""' 2>/dev/null) -X POST -d '$mcp_initialize_payload' '$url' 2>/dev/null")" || response_body=""
 
         server_json="$(echo "$server_json" | jq --arg hc "$http_code" '. + { http_status: $hc }')"
 
@@ -585,7 +635,12 @@ audit_settings() {
 get_cli_mcp_list() {
   if command -v claude &>/dev/null; then
     local output
-    output="$(timeout --signal=KILL 5 claude mcp list 2>&1 </dev/null)" || output="(claude mcp list timed out or failed — this is normal outside an interactive session)"
+    if command -v timeout &>/dev/null; then
+      output="$(timeout 5 claude mcp list 2>&1 </dev/null)" || output="(claude mcp list timed out or failed — this is normal outside an interactive session)"
+    else
+      # macOS without coreutils: no timeout command available
+      output="$(claude mcp list 2>&1 </dev/null)" || output="(claude mcp list failed — this is normal outside an interactive session)"
+    fi
     echo "$output"
   else
     echo "(claude CLI not found in PATH — config files were parsed directly instead)"
@@ -701,8 +756,9 @@ main() {
   local total_checked
   total_checked="$(echo "$config_files" | jq 'length')"
 
-  # ── Assemble final output ──
-  jq -n \
+  # ── Assemble final output (with section filtering) ──
+  local full_output
+  full_output="$(jq -n \
     --arg platform "$PLATFORM" \
     --arg project_root "$PROJECT_ROOT" \
     --arg cwd "$PROJECT_DIR" \
@@ -744,6 +800,29 @@ main() {
         conflicts: ($conflicts | length)
       }
     }'
+  )"
+
+  # Apply section filter
+  case "$SECTION" in
+    all)
+      echo "$full_output"
+      ;;
+    configs)
+      echo "$full_output" | jq '{ meta, config_files, summary }'
+      ;;
+    servers)
+      echo "$full_output" | jq '{ meta, effective_servers, all_servers_all_tiers, conflicts, summary }'
+      ;;
+    health)
+      echo "$full_output" | jq '{ meta, effective_servers, environment, cli_mcp_list, summary }'
+      ;;
+    settings)
+      echo "$full_output" | jq '{ meta, settings_audit, summary }'
+      ;;
+    *)
+      echo "$full_output"
+      ;;
+  esac
 }
 
 main
